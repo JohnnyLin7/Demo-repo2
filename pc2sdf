@@ -1,0 +1,156 @@
+import open3d as o3d
+import numpy as np
+import os
+from tqdm import tqdm
+import scipy
+import random
+import trimesh
+import mesh_to_sdf as ms
+import pickle
+from sklearn.neighbors import NearestNeighbors
+
+# local file
+import utils.volume_structure as vs 
+import utils.point_structure as ps 
+import utils.cloud_structure as cs 
+
+# parameters
+FOLDER = "./test/"
+model_name = "test"
+result_pickle = os.path.join(FOLDER, "result.pkl")
+
+def point_cloud_to_sdf(voxels, point_cloud, normals):  
+    sdf_grid = np.zeros(len(voxels))
+    nn = NearestNeighbors(n_neighbors=5)
+    nn.fit(point_cloud)
+    distances, indices = nn.kneighbors(voxels)
+    print(distances)
+    
+    for i, (distance, index) in enumerate(zip(distances, indices)):
+        normal = np.mean(normals[index], axis=0)
+        mean_point = np.mean(point_cloud[index], axis=0)
+        voxel_to_mean_point = mean_point - voxels[i]
+        angle = np.arccos(np.dot(voxel_to_mean_point, normal) / \
+            (np.linalg.norm(voxel_to_mean_point) * np.linalg.norm(normal)))
+        distance = np.mean(distance)
+        sdf_grid[i] = distance if np.degrees(angle) < 90 else -distance
+    
+    return sdf_grid
+    
+
+def read_pkl(file_name):
+    with open(file_name, "rb") as f:
+        cloud = pickle.load(f)
+    return cloud
+
+# ----- draw part ----- #
+def visualizeRangeBox():
+    connect_lines = [[0, 1],[0, 2],[1, 3],[2, 3],[4, 5],
+        [4, 6],[5, 7],[6, 7],[0, 4],[1, 5],[2, 6],[3, 7]]
+    bounding_box = [[-1, -1, -1], [ 1, -1, -1],
+                    [-1,  1, -1], [ 1,  1, -1],
+                    [-1, -1,  1], [ 1, -1,  1],
+                    [-1,  1,  1], [ 1,  1,  1]]
+    points = np.array(bounding_box)
+    line_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(points),
+        lines=o3d.utility.Vector2iVector(connect_lines))
+    line_set.paint_uniform_color([1, 0, 0])
+    return [line_set]
+
+def visualize_PCD(pcd, normals):
+    # create a new PointCloud object with custom color
+    custom_color = np.array([0.0, 0.0, 0.8])
+    temp = o3d.geometry.PointCloud() # point cloud
+    temp.points = o3d.utility.Vector3dVector(pcd)
+    temp.paint_uniform_color(custom_color)
+    temp.normals = o3d.utility.Vector3dVector(normals)
+
+    o3d.visualization.draw_geometries([temp] + visualizeRangeBox(), 
+        width = 1440, height = 1440, mesh_show_wireframe=True,
+                            point_show_normal=True)
+    
+def visualize_SDF(voxels, sdf):
+    max_sdf, min_sdf = np.max(sdf), np.min(sdf)
+    # print(max_sdf, min_sdf)
+    delta_p = abs(max_sdf) / 255 # positive
+    delta_n = abs(min_sdf) / 255 # negative
+
+    colors = np.zeros(voxels.shape)
+    for i in range(voxels.shape[0]):
+        temp = 0 # init
+
+        if sdf[i] > 0: temp = sdf[i] / delta_p
+        else:          temp = sdf[i] / delta_n
+        
+        if temp[0] < 0: colors[i, :] = [0, - temp[0] / 255, 0.5]
+        else:           colors[i, :] = [temp[0] / 255, 0, 0.5]
+
+
+    sdf = o3d.geometry.PointCloud() # sdf cloud data
+    sdf.points = o3d.utility.Vector3dVector(voxels)
+    sdf.colors = o3d.utility.Vector3dVector(colors)
+
+    o3d.visualization.draw_geometries([sdf] + \
+                                      visualizeRangeBox(), 
+        width = 1440, height = 1440, mesh_show_wireframe=True)
+    
+
+# main    
+if __name__ == '__main__':        
+    print("Loading mesh data.")
+
+    if not os.path.exists(result_pickle):  
+        print("Need input pickle file.")
+        exit()
+        
+    cloud = read_pkl(result_pickle)
+    print(f"PointCloud with {len(cloud.surfel_list)} volumes.")
+
+    voxels = []; size = 32
+    for x in range(size):
+        for y in range(size):
+            for z in range(size):
+                voxels.append([x, y, z]) 
+    voxels = np.array(voxels)
+    voxels = (2.0 / float(size)) * voxels - 1.0
+    voxels = voxels.reshape([-1, 3]) 
+        
+    # get each point cloud
+    for i in tqdm(range(len(cloud.surfel_list))):
+        points = np.array([cloud.vertex_list[j].position 
+                for j in cloud.surfel_list[i].cloud])
+        normals = np.array([cloud.vertex_list[j].normal 
+                for j in cloud.surfel_list[i].cloud])
+        rot_mat = np.linalg.inv(cloud.surfel_list[i].axis)
+        tran_mat = -1 * np.array(cloud.surfel_list[i].center)
+        points = np.dot(points + tran_mat, rot_mat)
+        points = points / cloud.surfel_list[i].range[1]
+        # visualize_PCD(points, normals)
+        
+        data_path = os.path.join(FOLDER, "%04d" % i)
+        if not os.path.exists(data_path):
+            os.makedirs(data_path)
+        # output
+        temp = o3d.geometry.PointCloud() # point cloud
+        temp.points = o3d.utility.Vector3dVector(points)
+        temp.normals = o3d.utility.Vector3dVector(normals)
+        o3d.io.write_point_cloud(os.path.join(data_path, "init.ply"), temp)
+
+        sdf = point_cloud_to_sdf(voxels, points, normals)
+        # visualize sdf
+        assert(voxels.shape[0] == sdf.shape[0])
+        sdf = sdf[:, np.newaxis] 
+        # visualize_SDF(voxels, sdf)
+        
+        # output
+        SDF_cloud = np.concatenate((voxels, sdf), axis = 1)  
+        pos_cloud = np.array([i for i in SDF_cloud if i[3] >= 0])
+        neg_cloud = np.array([i for i in SDF_cloud if i[3] < 0])
+        
+        np.savez(os.path.join(data_path, "init.npz"), 
+                pos = pos_cloud, neg = neg_cloud) 
+                # fit with the DeepSDF input
+        
+        with open(os.path.join(data_path, "id.txt"), 'w') as f:
+            f.write(str(cloud.surfel_list[i].id))
